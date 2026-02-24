@@ -64,6 +64,11 @@
         "dmg",
         "zip"
       ],
+      "binaries": [
+        "node_modules/ffmpeg-static/ffmpeg",
+        "native/mouse-telemetry",
+        "native/cursor-control"
+      ],
       "hardenedRuntime": true,
       "gatekeeperAssess": false,
       "entitlements": "build/entitlements.mac.plist",

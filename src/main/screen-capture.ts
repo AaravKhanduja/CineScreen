@@ -255,8 +255,21 @@ export class ScreenCapture {
 
           // Check for common error patterns
           let errorMessage = 'Screen recording failed to start';
-          if (stderrOutput.includes('Could not create') || stderrOutput.includes('Permission denied')) {
-            errorMessage = 'Screen recording permission denied. Please grant screen recording permission and try again.';
+          const permissionDenied =
+            stderrOutput.includes('Could not create') ||
+            stderrOutput.includes('Permission denied') ||
+            stderrOutput.includes('not authorized') ||
+            stderrOutput.includes('cannot capture');
+
+          if (permissionDenied) {
+            if (isMac) {
+              errorMessage =
+                'Screen capture permission was denied for the FFmpeg capture process. ' +
+                'On macOS this can happen when FFmpeg is not trusted by TCC. ' +
+                'Use a signed CineScreen build and re-grant Screen Recording permission.';
+            } else {
+              errorMessage = 'Screen recording permission denied. Please grant screen recording permission and try again.';
+            }
           } else if (stderrOutput.includes('Invalid device') || stderrOutput.includes('No such device')) {
             errorMessage = 'Screen capture device not found. Please check your display settings.';
           } else if (code !== 0) {
@@ -579,4 +592,3 @@ export class ScreenCapture {
     return this.isRecording;
   }
 }
-

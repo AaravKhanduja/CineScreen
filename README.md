@@ -176,6 +176,7 @@ CineScreen requires the following macOS permissions:
 - **Accessibility** - Required for precise mouse movement tracking
 
 These permissions are requested automatically on first launch. You can also grant them manually in System Settings > Privacy & Security.
+Because CineScreen records on macOS through a bundled FFmpeg binary (`avfoundation`), use a properly signed build (`npm run package:mac`) when validating permissions. Unsigned/ad-hoc builds can report permission as granted in Electron while FFmpeg still receives black frames.
 
 ### Windows
 CineScreen may require administrator privileges for certain features. No additional permissions are typically required.

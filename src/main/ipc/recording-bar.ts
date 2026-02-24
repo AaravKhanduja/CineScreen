@@ -9,6 +9,7 @@ import type { Platform } from '../../platform';
 import type { CursorConfig, ZoomConfig } from '../../types';
 import { MetadataExporter } from '../../processing/metadata-exporter';
 import { createLogger } from '../../utils/logger';
+import { hasRequiredRecordingPermissions } from '../services/permissions-service';
 import {
   getRecordingState,
   getCurrentRecordingConfig,
@@ -268,7 +269,7 @@ export function registerRecordingBarHandlers(
     logger.debug('Checking permissions...');
     const permissions = platform.permissions.getDetailedStatus();
     logger.debug('Permissions check result:', permissions);
-    if (permissions.screenRecording.state !== 'granted' || permissions.accessibility.state !== 'granted') {
+    if (!hasRequiredRecordingPermissions(permissions)) {
       logger.error('Required permissions not granted');
       // Open main window and show toast
       let mainWindow = getMainWindow();

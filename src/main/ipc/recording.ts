@@ -9,6 +9,7 @@ import type { Platform } from '../../platform';
 import type { RecordingConfig, CursorConfig, ZoomConfig, MouseEffectsConfig } from '../../types';
 import { MetadataExporter } from '../../processing/metadata-exporter';
 import { createLogger } from '../../utils/logger';
+import { hasRequiredRecordingPermissions } from '../services/permissions-service';
 import {
   getRecordingState,
   getCurrentRecordingConfig,
@@ -49,7 +50,7 @@ export function registerRecordingHandlers(
     logger.debug('Checking permissions...');
     const permissions = platform.permissions.getDetailedStatus();
     logger.debug('Permissions check result:', permissions);
-    if (permissions.screenRecording.state !== 'granted' || permissions.accessibility.state !== 'granted') {
+    if (!hasRequiredRecordingPermissions(permissions)) {
       logger.error('Required permissions not granted');
       throw new Error('Required permissions not granted. Please grant Screen Recording and Accessibility permissions.');
     }
