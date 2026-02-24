@@ -168,6 +168,27 @@ function easeOutCubic(t: number): number {
 }
 
 /**
+ * Find the index of the first click with timestamp >= target using binary search.
+ * Clicks must be sorted by timestamp.
+ */
+function findFirstClickIndex(
+  clicks: RecordingMetadata['clicks'],
+  targetTimestamp: number
+): number {
+  let lo = 0;
+  let hi = clicks.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    if (clicks[mid].timestamp < targetTimestamp) {
+      lo = mid + 1;
+    } else {
+      hi = mid;
+    }
+  }
+  return lo;
+}
+
+/**
  * Render click circles on canvas at click positions
  */
 function renderClickCircles(
@@ -200,16 +221,19 @@ function renderClickCircles(
   const offsetX = (displayWidth - actualDisplayWidth) / 2;
   const offsetY = (displayHeight - actualDisplayHeight) / 2;
 
-  for (const click of clicks) {
+  // Binary search for the first click that could be active (timestamp >= current - duration)
+  const windowStart = timestamp - duration;
+  const startIdx = findFirstClickIndex(clicks, windowStart);
+
+  for (let i = startIdx; i < clicks.length; i++) {
+    const click = clicks[i];
+    if (click.timestamp > timestamp) break; // Past current time, no more active circles
     if (click.action !== 'down') continue;
-    if (click.x == null || click.y == null) continue;
 
     const elapsed = timestamp - click.timestamp;
-    if (elapsed < 0 || elapsed > duration) continue;
-
     const progress = elapsed / duration;
     const radius = size * scale * easeOutCubic(progress);
-    const opacity = 1.0 * (1 - progress);
+    const opacity = 1 - progress;
 
     const x = click.x * scale + offsetX;
     const y = click.y * scale + offsetY;
@@ -306,11 +330,11 @@ export function renderCursor(
   // Scale cursor size (base scale * click animation scale)
   const cursorSize = size * scale * clickAnimationScale;
 
+  // Draw click circles behind cursor
+  renderClickCircles(ctx, metadata, timestamp, videoWidth, videoHeight, displayWidth, displayHeight);
+
   // Draw cursor using actual SVG assets
   drawCursorShape(ctx, x, y, cursorSize, shape);
-
-  // Draw click circles on top of cursor
-  renderClickCircles(ctx, metadata, timestamp, videoWidth, videoHeight, displayWidth, displayHeight);
 }
 
 /**

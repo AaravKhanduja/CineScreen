@@ -1,7 +1,7 @@
 import sharp from 'sharp';
 import { existsSync, readFileSync } from 'fs';
 import type { ZoomConfig, CursorConfig, MouseEffectsConfig } from '../types';
-import type { CursorKeyframe, EasingType } from '../types/metadata';
+import type { CursorKeyframe, EasingType, ClickEvent } from '../types/metadata';
 import { generateSmoothedZoom } from './zoom-tracker';
 import { createLogger } from '../utils/logger';
 import { applyCursorMotionBlur } from './motion-blur';
@@ -35,11 +35,15 @@ const logger = createLogger('SharpRenderer');
 // Cache for prepared cursor images (shape+size -> buffer)
 const cursorCache: Map<string, Buffer> = new Map();
 
+// Cache for click circle SVG buffers (radius+color+opacity+strokeWidth -> buffer)
+const clickCircleCache: Map<string, Buffer> = new Map();
+
 /**
  * Clear the cursor cache (call between exports to free memory)
  */
 function clearCursorCache(): void {
   cursorCache.clear();
+  clickCircleCache.clear();
 }
 
 export interface FrameRenderOptions {
@@ -266,22 +270,10 @@ export async function renderFrame(
   const cursorTop = Math.round(frameData.cursorY - hotspotOffsetY);
 
   // Collect all overlays into a single composite call (Sharp replaces previous composites)
+  // Click circles are added first so they render behind the cursor
   const composites: sharp.OverlayOptions[] = [];
 
-  // Cursor overlay
-  if (cursorBuffer) {
-    const clampedLeft = Math.max(-hotspotOffsetX, Math.min(outputWidth - scaledCursorSize + hotspotOffsetX, cursorLeft));
-    const clampedTop = Math.max(-hotspotOffsetY, Math.min(outputHeight - scaledCursorSize + hotspotOffsetY, cursorTop));
-
-    composites.push({
-      input: cursorBuffer,
-      left: clampedLeft,
-      top: clampedTop,
-      blend: 'over',
-    });
-  }
-
-  // Click circle overlays
+  // Click circle overlays (rendered behind cursor)
   const activeCircles = frameData.activeClickCircles;
   if (options.effects?.clickCircles?.enabled && activeCircles && activeCircles.length > 0) {
     const {
@@ -292,20 +284,35 @@ export async function renderFrame(
     for (const circle of activeCircles) {
       const easedProgress = 1 - Math.pow(1 - circle.progress, 3);
       const radius = Math.round(size * scale * easedProgress);
-      const opacity = 1.0 * (1 - circle.progress);
+      const opacity = 1 - circle.progress;
       const strokeWidth = Math.max(1, Math.round(3 * scale));
 
       if (radius <= 0) continue;
 
       const svgSize = (radius + strokeWidth) * 2;
-      const svgCenter = svgSize / 2;
       const fillOpacity = opacity * 0.15;
-      const svg = Buffer.from(
-        `<svg width="${svgSize}" height="${svgSize}" xmlns="http://www.w3.org/2000/svg">` +
-        `<circle cx="${svgCenter}" cy="${svgCenter}" r="${radius}" ` +
-        `fill="${color}" fill-opacity="${fillOpacity}" stroke="${color}" stroke-width="${strokeWidth}" opacity="${opacity}"/>` +
-        `</svg>`
-      );
+      // Round opacity to 2 decimal places for better cache hit rate
+      const roundedOpacity = Math.round(opacity * 100) / 100;
+      const roundedFillOpacity = Math.round(fillOpacity * 100) / 100;
+      const cacheKey = `${radius}_${color}_${roundedOpacity}_${roundedFillOpacity}_${strokeWidth}_${svgSize}`;
+
+      let circleBuffer = clickCircleCache.get(cacheKey);
+      if (!circleBuffer) {
+        const svgCenter = svgSize / 2;
+        const svg = Buffer.from(
+          `<svg width="${svgSize}" height="${svgSize}" xmlns="http://www.w3.org/2000/svg">` +
+          `<circle cx="${svgCenter}" cy="${svgCenter}" r="${radius}" ` +
+          `fill="${color}" fill-opacity="${roundedFillOpacity}" stroke="${color}" stroke-width="${strokeWidth}" opacity="${roundedOpacity}"/>` +
+          `</svg>`
+        );
+        try {
+          circleBuffer = await sharp(svg).png().toBuffer();
+          clickCircleCache.set(cacheKey, circleBuffer);
+        } catch (err) {
+          logger.debug('Failed to convert click circle SVG to buffer:', err);
+          continue;
+        }
+      }
 
       const circleX = Math.round(circle.x * scale + offsetX);
       const circleY = Math.round(circle.y * scale + offsetY);
@@ -313,19 +320,27 @@ export async function renderFrame(
       const top = Math.round(circleY - svgSize / 2);
 
       if (left + svgSize > 0 && left < outputWidth && top + svgSize > 0 && top < outputHeight) {
-        try {
-          const circleBuffer = await sharp(svg).png().toBuffer();
-          composites.push({
-            input: circleBuffer,
-            left: Math.max(0, left),
-            top: Math.max(0, top),
-            blend: 'over',
-          });
-        } catch {
-          // Skip this circle if SVG conversion fails
-        }
+        composites.push({
+          input: circleBuffer,
+          left: Math.max(0, left),
+          top: Math.max(0, top),
+          blend: 'over',
+        });
       }
     }
+  }
+
+  // Cursor overlay (rendered on top of click circles)
+  if (cursorBuffer) {
+    const clampedLeft = Math.max(-hotspotOffsetX, Math.min(outputWidth - scaledCursorSize + hotspotOffsetX, cursorLeft));
+    const clampedTop = Math.max(-hotspotOffsetY, Math.min(outputHeight - scaledCursorSize + hotspotOffsetY, cursorTop));
+
+    composites.push({
+      input: cursorBuffer,
+      left: clampedLeft,
+      top: clampedTop,
+      blend: 'over',
+    });
   }
 
   if (composites.length > 0) {
@@ -350,7 +365,7 @@ export function createFrameDataFromKeyframes(
   videoDimensions: { width: number; height: number },
   cursorConfig?: CursorConfig,
   zoomConfig?: ZoomConfig,
-  clicks?: Array<{ timestamp: number; action: string; x?: number; y?: number }>,
+  clicks?: ClickEvent[],
   effects?: MouseEffectsConfig
 ): FrameData[] {
   const frameInterval = 1000 / frameRate;
@@ -511,7 +526,7 @@ export function createFrameDataFromKeyframes(
       for (const click of clicks) {
         if (click.action !== 'down') continue;
         const elapsed = timestamp - click.timestamp;
-        if (elapsed >= 0 && elapsed <= duration && click.x != null && click.y != null) {
+        if (elapsed >= 0 && elapsed <= duration) {
           circles.push({
             x: click.x,
             y: click.y,
