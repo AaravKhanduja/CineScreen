@@ -2,14 +2,26 @@
  * Recording bar IPC handlers
  */
 
-import { app, ipcMain, BrowserWindow } from 'electron';
-import { join, dirname } from 'path';
-import { existsSync, mkdirSync, copyFileSync } from 'fs';
+import { ipcMain, BrowserWindow } from 'electron';
 import type { Platform } from '../../platform';
 import type { CursorConfig, ZoomConfig } from '../../types';
-import { MetadataExporter } from '../../processing/metadata-exporter';
 import { createLogger } from '../../utils/logger';
 import { hasRequiredRecordingPermissions } from '../services/permissions-service';
+import {
+  cleanupFailedRecordingStart,
+  createDefaultCursorConfig,
+  createDefaultZoomConfig,
+  createTempRecordingPaths,
+  finalizeRecordingOutput,
+  startCaptureSession,
+  stopCaptureAndCollectData,
+} from '../services/recording-service';
+import {
+  hideMainWindow,
+  openMainWindowAndShowToast,
+  openOrCreateMainWindow,
+  setContentProtection,
+} from '../services/window-feedback-service';
 import {
   getRecordingState,
   getCurrentRecordingConfig,
@@ -59,18 +71,8 @@ export function registerRecordingBarHandlers(
     // Load configs from persistent store
     const userConfig = loadConfig();
 
-    const cursorConfig: CursorConfig = {
-      size: userConfig.cursorSize,
-      shape: userConfig.cursorShape as CursorConfig['shape'],
-    };
-
-    const zoomConfig: ZoomConfig = {
-      enabled: userConfig.zoomEnabled,
-      level: userConfig.zoomLevel,
-      transitionSpeed: 300,
-      padding: 0,
-      followSpeed: 1.0,
-    };
+    const cursorConfig: CursorConfig = createDefaultCursorConfig(userConfig);
+    const zoomConfig: ZoomConfig = createDefaultZoomConfig(userConfig);
 
     const mainWindow = getMainWindow();
     const screenCapture = getScreenCapture();
@@ -80,83 +82,27 @@ export function registerRecordingBarHandlers(
     try {
       const platform = await initPlatform();
 
-      // Stop screen recording
-      logger.info('Stopping screen recording...');
-      const videoPath = await screenCapture?.stopRecording();
-      logger.info('Screen recording stopped, video path:', videoPath);
-
-      // Show system cursor again
-      logger.info('Showing system cursor...');
-      await platform.cursor.ensureVisible();
+      const { videoPath, mouseEvents } = await stopCaptureAndCollectData({
+        platform,
+        screenCapture,
+        mouseTracker,
+        recordingState,
+      });
 
       // Disable content protection on main window if it exists
-      if (mainWindow && !mainWindow.isDestroyed()) {
-        mainWindow.setContentProtection(false);
-      }
+      setContentProtection(mainWindow, false);
 
       // Show recording bar in idle mode
       showRecordingBarIdle();
 
-      if (!videoPath) {
-        throw new Error('Failed to stop recording');
-      }
-
-      // Stop mouse tracking
-      logger.info('Stopping mouse tracking...');
-      mouseTracker?.stopTracking();
-
-      // Save mouse data
-      if (mouseTracker && recordingState.tempMouseDataPath) {
-        mouseTracker.saveToFile(recordingState.tempMouseDataPath);
-      }
-
-      // Get mouse events
-      const mouseEvents = mouseTracker?.getEvents() || [];
-      const recordingDuration = Date.now() - (recordingState.startTime || 0);
-
-      // Determine final output path
-      const finalOutputPath =
-        recordingState.outputPath ||
-        join(app.getPath('downloads'), `recording_${Date.now()}.mp4`);
-
-      // Ensure output directory exists
-      const outputDir = dirname(finalOutputPath);
-      if (!existsSync(outputDir)) {
-        mkdirSync(outputDir, { recursive: true });
-      }
-
-      // Copy video to final location
-      const videoExtension = videoPath.split('.').pop() || 'mkv';
-      const finalVideoPath = finalOutputPath.replace(/\.(mp4|mov|mkv|avi|webm)$/i, `.${videoExtension}`);
-
-      logger.info('Copying video to final location:', finalVideoPath);
-      copyFileSync(videoPath, finalVideoPath);
-
-      // Export metadata
-      let screenDimensions: { width: number; height: number } | undefined;
-      try {
-        const { getScreenDimensions } = await import('../../processing/video-utils');
-        screenDimensions = await getScreenDimensions();
-      } catch (error) {
-        logger.warn('Could not get screen dimensions:', error);
-      }
-
-      const exporter = new MetadataExporter();
-      const mouseToVideoOffset = recordingState.mouseToVideoOffset || 0;
-      const adjustedMouseEvents = mouseEvents.map(event => ({
-        ...event,
-        timestamp: Math.max(0, event.timestamp - mouseToVideoOffset),
-      }));
-
-      const metadataPath = await exporter.exportMetadata({
-        videoPath: finalVideoPath,
-        mouseEvents: adjustedMouseEvents,
+      const { finalVideoPath, metadataPath } = await finalizeRecordingOutput({
+        videoPath,
+        mouseEvents,
+        recordingState,
+        currentRecordingConfig,
+        userConfig,
         cursorConfig,
         zoomConfig,
-        frameRate: parseInt(userConfig.frameRate, 10) || 60,
-        videoDuration: recordingDuration,
-        screenDimensions,
-        recordingRegion: currentRecordingConfig?.region,
       });
 
       logger.info('Recording completed successfully');
@@ -242,14 +188,7 @@ export function registerRecordingBarHandlers(
   // Open main window from recording bar menu
   ipcMain.handle('open-main-window', async () => {
     logger.info('IPC: open-main-window called');
-
-    const mainWindow = getMainWindow();
-    if (!mainWindow || mainWindow.isDestroyed()) {
-      createWindow();
-    } else {
-      mainWindow.show();
-      mainWindow.focus();
-    }
+    openOrCreateMainWindow(getMainWindow, createWindow);
   });
 
   // Start recording from recording bar
@@ -271,31 +210,15 @@ export function registerRecordingBarHandlers(
     logger.debug('Permissions check result:', permissions);
     if (!hasRequiredRecordingPermissions(permissions)) {
       logger.error('Required permissions not granted');
-      // Open main window and show toast
-      let mainWindow = getMainWindow();
-      if (!mainWindow || mainWindow.isDestroyed()) {
-        createWindow();
-        mainWindow = getMainWindow();
-      } else {
-        mainWindow.show();
-        mainWindow.focus();
-      }
-      // Wait for window to be ready then send toast
-      const sendToast = () => {
-        const win = getMainWindow();
-        if (win && !win.isDestroyed()) {
-          win.webContents.send('show-toast', {
-            message: 'Please grant Screen Recording and Accessibility permissions before recording',
-            type: 'warning',
-            switchTab: 'permissions',
-          });
-        }
-      };
-      if (mainWindow?.webContents.isLoading()) {
-        mainWindow.webContents.once('did-finish-load', sendToast);
-      } else {
-        sendToast();
-      }
+      openMainWindowAndShowToast({
+        getMainWindow,
+        createWindow,
+        toast: {
+          message: 'Please grant Screen Recording and Accessibility permissions before recording',
+          type: 'warning',
+          switchTab: 'permissions',
+        },
+      });
       return { success: false, reason: 'permissions' };
     }
 
@@ -303,30 +226,15 @@ export function registerRecordingBarHandlers(
     const configuredOutputPath = getConfiguredOutputPath();
     if (!configuredOutputPath) {
       logger.error('Output path not configured');
-      // Open main window and show toast
-      let mainWindow = getMainWindow();
-      if (!mainWindow || mainWindow.isDestroyed()) {
-        createWindow();
-        mainWindow = getMainWindow();
-      } else {
-        mainWindow.show();
-        mainWindow.focus();
-      }
-      const sendToast = () => {
-        const win = getMainWindow();
-        if (win && !win.isDestroyed()) {
-          win.webContents.send('show-toast', {
-            message: 'Please set an output path before recording',
-            type: 'warning',
-            switchTab: 'recording',
-          });
-        }
-      };
-      if (mainWindow?.webContents.isLoading()) {
-        mainWindow.webContents.once('did-finish-load', sendToast);
-      } else {
-        sendToast();
-      }
+      openMainWindowAndShowToast({
+        getMainWindow,
+        createWindow,
+        toast: {
+          message: 'Please set an output path before recording',
+          type: 'warning',
+          switchTab: 'recording',
+        },
+      });
       return { success: false, reason: 'output-path' };
     }
 
@@ -336,16 +244,7 @@ export function registerRecordingBarHandlers(
     const mouseTracker = createMouseTracker();
 
     // Generate temp file paths
-    const tempDir = join(app.getPath('temp'), 'screen-recorder');
-    logger.debug('Temp directory:', tempDir);
-    if (!existsSync(tempDir)) {
-      logger.debug('Creating temp directory');
-      mkdirSync(tempDir, { recursive: true });
-    }
-
-    const timestamp = Date.now();
-    const tempVideoPath = join(tempDir, `recording_${timestamp}.mkv`);
-    const tempMouseDataPath = join(tempDir, `mouse_${timestamp}.json`);
+    const { tempVideoPath, tempMouseDataPath } = createTempRecordingPaths();
 
     setRecordingState({
       isRecording: true,
@@ -357,49 +256,32 @@ export function registerRecordingBarHandlers(
 
     // Create recording config from persisted settings
     const userConfig = loadConfig();
-    setCurrentRecordingConfig({
+    const recordingConfig = {
       outputPath: configuredOutputPath,
       frameRate: parseInt(userConfig.frameRate, 10) || 60,
-    });
+    };
+    setCurrentRecordingConfig(recordingConfig);
 
     const mainWindow = getMainWindow();
 
     try {
       // Hide the main window during recording
-      if (mainWindow && !mainWindow.isDestroyed()) {
-        mainWindow.setContentProtection(true);
-        mainWindow.hide();
-      }
+      setContentProtection(mainWindow, true);
+      hideMainWindow(mainWindow);
 
-      // Hide system cursor FIRST
-      logger.info('Hiding system cursor...');
-      await platform.cursor.hide();
-
-      // Buffer time after cursor hide
-      await new Promise(resolve => setTimeout(resolve, 100));
-
-      // Start mouse tracking
-      logger.info('Starting mouse tracking...');
-      const mouseTrackingStartTime = Date.now();
-      await mouseTracker.startTracking();
-      logger.info('Mouse tracking started');
-
-      // Start screen recording
-      logger.info('Starting screen recording...');
-      const currentConfig = getCurrentRecordingConfig();
-      await screenCapture.startRecording({
-        ...currentConfig!,
-        outputPath: tempVideoPath,
+      const mouseToVideoOffset = await startCaptureSession({
+        platform,
+        screenCapture,
+        mouseTracker,
+        recordingConfig,
+        tempVideoPath,
       });
-      const videoStartTime = Date.now();
-      const mouseToVideoOffset = videoStartTime - mouseTrackingStartTime;
 
       const currentState = getRecordingState();
       setRecordingState({
         ...currentState,
         mouseToVideoOffset,
       });
-      logger.info(`Screen recording started successfully. Mouse-to-video offset: ${mouseToVideoOffset}ms`);
 
       // Hide the recording bar completely during recording
       hideRecordingBar();
@@ -408,11 +290,7 @@ export function registerRecordingBarHandlers(
     } catch (error) {
       logger.error('Error starting recording from bar:', error);
       setRecordingState({ isRecording: false });
-      mouseTracker?.stopTracking();
-      await platform.cursor.show();
-      if (mainWindow) {
-        mainWindow.setContentProtection(false);
-      }
+      await cleanupFailedRecordingStart({ platform, mouseTracker, mainWindow });
       // Show recording bar again in idle mode on error
       showRecordingBarIdle();
       throw error;
