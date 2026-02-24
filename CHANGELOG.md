@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.3.4]
+
+### Added
+- Circle click animation effect for cursor interactions
+- Centralized permission service in the main process (`src/main/services/permissions-service.ts`)
+
+### Fixed
+- macOS FFmpeg screen capture reliability by ensuring the bundled FFmpeg binary is included in mac code-signing targets
+
+### Changed
+- Added packaged-app FFmpeg signature verification warning in the notarization step
+
 ## [1.3.3]
 
 ### Added
